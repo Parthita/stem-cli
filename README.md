@@ -26,7 +26,7 @@ A **node** contains:
 
 Intent must be explicit because inference is unsafe. stem never guesses why you made changes - you must declare your reasoning before creating each checkpoint. This forces clarity of thought and preserves decision context.
 
-## Non-goals (important)
+## Non-goals 
 
 stem does NOT:
 - Replace Git or abstract away Git concepts
@@ -38,7 +38,7 @@ stem does NOT:
 
 stem is a complementary tool that adds intentional structure to your existing Git workflow.
 
-## How stem works (mental model)
+## How stem works 
 
 1. **Initialize**: `stem create` sets up stem metadata in your existing Git repository
 2. **Declare intent**: `stem branch "reason for changes"` creates a new node with your explicit reasoning
@@ -135,7 +135,7 @@ stem may not be useful if you:
 
 ## Status
 
-This is a v1 tool under active development. It has been tested across platforms and includes comprehensive error handling, but you should use it cautiously on important projects.
+This is a v1 tool under active development and you should use it cautiously on important projects.
 
 The core functionality is stable, but the interface and features may evolve based on user feedback. We recommend trying stem on a small repository first to understand its workflow and determine if it fits your development style.
 
