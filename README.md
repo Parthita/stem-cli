@@ -53,13 +53,23 @@ Each node is backed by a Git branch following the naming convention `stem/<user>
 
 Requires Git and Python 3.8+.
 
+### From source (current method)
+
 ```bash
-pipx install stem-cli
+git clone https://github.com/Parthita/stem-cli.git
+cd stem-cli
+pipx install .
 ```
 
 Or with pip:
 ```bash
-pip install stem-cli
+pip install .
+```
+
+### From PyPI (coming soon)
+
+```bash
+pipx install stem-cli
 ```
 
 Verify installation:
