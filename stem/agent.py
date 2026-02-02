@@ -2,14 +2,14 @@
 Agent Integration Layer - Handle agent intent declaration and processing.
 
 Provides functionality for agents to declare intent through JSON files,
-generate AGENT.md documentation, and process agent intents to trigger
-stem branch operations.
+generate AGENT.md documentation, and process agent intents to record
+suggestions for user confirmation.
 """
 
 import json
 import os
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Optional
 from dataclasses import dataclass
 
 
@@ -25,9 +25,10 @@ def create_agent_md(force: bool = False) -> bool:
     
     Creates comprehensive documentation explaining how agents should
     interact with the stem system through intent declaration.
+    If AGENT.md already exists, appends stem integration rules to it.
     
     Args:
-        force: If True, overwrite existing AGENT.md file
+        force: If True, overwrite existing AGENT.md file completely
         
     Returns:
         bool: True if file was created/updated, False if skipped
@@ -39,87 +40,99 @@ def create_agent_md(force: bool = False) -> bool:
     
     # Check if file already exists
     if agent_md_path.exists() and not force:
-        print("AGENT.md already exists. Use --force to overwrite or remove it manually.")
-        return False
-    
-    agent_md_content = """# Stem Agent Integration Rules
+        # Append to existing file instead of overwriting
+        try:
+            existing_content = agent_md_path.read_text(encoding='utf-8')
+            
+            # Check if stem integration rules already exist
+            if "# Stem Agent Integration Guide" in existing_content:
+                print("AGENT.md already contains stem integration rules")
+                return False
+            
+            # Append stem integration rules
+            stem_integration_section = """
 
-## Core Principles
+---
 
-The stem system is designed to work seamlessly with AI agents while maintaining human control over all meaningful decisions. Agents can declare their intent to make changes, but the system will only create nodes when intent is explicitly declared.
+# AI Agent Integration
 
-### Key Rules
+## Workflow
+1. Write intent JSON to `.git/stem/intent/next.json` only if you will change code
+2. Make code changes
+3. System auto-creates node after changes complete (idle)
 
-1. **Declare intent BEFORE making changes** - Always write your intent JSON before modifying any files
-2. **Use descriptive prompts** - Explain WHY you're making changes, not just what you're changing
-3. **Provide summaries when possible** - Help users understand what you accomplished
-4. **Respect the timing** - The system will auto-commit after detecting file changes and an idle period
-
-## Intent Declaration Format
-
-To declare your intent to make changes, write a JSON file to `.git/stem/intent/next.json`:
-
+## Intent Format
 ```json
 {
-    "prompt": "add user authentication system",
-    "summary": "Created Login.jsx component and useAuth hook for handling user sessions"
+    "prompt": "user's request",
+    "summary": "what you changed"
 }
 ```
 
-### Required Fields
+## Example
+User: "Add login form"
 
-- `prompt` (string): A clear explanation of WHY you're making these changes. This becomes the node's prompt and should be meaningful to humans reviewing the code history.
-
-### Optional Fields
-
-- `summary` (string): A description of WHAT you changed. If provided, this will be used instead of the automatic git diff summary. Should be factual and specific.
-
-## Workflow
-
-1. **Plan your changes** - Decide what you want to accomplish
-2. **Write intent JSON** - Create `.git/stem/intent/next.json` with your prompt and optional summary
-3. **Make your changes** - Modify files as needed
-4. **Wait for auto-commit** - The system will detect changes and automatically create a stem node
-
-## Important Notes
-
-- The intent JSON file will be consumed and removed after processing
-- If no intent is declared, file changes will NOT create nodes automatically
-- Manual `stem branch` commands always work regardless of agent state
-- Agent assistance is optional - the system works fine without it
-- Multiple intents should be declared separately for different logical changes
-
-## Example Workflow
-
-```bash
-# Agent writes intent
-echo '{"prompt": "implement user login form", "summary": "Added LoginForm.jsx with validation"}' > .git/stem/intent/next.json
-
-# Agent makes changes
-# ... modify files ...
-
-# System detects changes after idle period and automatically:
-# 1. Reads the intent JSON
-# 2. Creates a new stem node with the prompt
-# 3. Uses agent summary or falls back to git diff
-# 4. Removes the intent JSON file
+Intent file:
+```json
+{
+    "prompt": "add login form",
+    "summary": "Added LoginForm.jsx with validation"
+}
 ```
 
-## Error Handling
+Then the system records the intent, waits for changes, and creates a node.
 
-- Invalid JSON will be logged and ignored
-- Missing prompt field will cause the intent to be ignored
-- File system errors will be handled gracefully
-- The system will never fail silently - all errors are reported
+## Rules
+- Only write intent if you will change code
+- No intent → no node
+- Agent suggestions are non-authoritative
+ - After any `stem jump`, read `.git/stem/context/current.json`
+"""
+            
+            # Append to existing file
+            with open(agent_md_path, 'a', encoding='utf-8') as f:
+                f.write(stem_integration_section)
+            
+            print("Appended stem integration rules to existing AGENT.md")
+            return True
+            
+        except OSError as e:
+            raise OSError(f"Failed to append to AGENT.md: {e}")
+    
+    # Create new file or overwrite if force=True
+    agent_md_content = """# AI Agent Integration
 
-## Integration with Manual Commands
+## Workflow
+1. Write intent JSON to `.git/stem/intent/next.json` only if you will change code
+2. Make code changes
+3. System auto-creates node after changes complete (idle)
 
-- `stem branch "manual prompt"` always works, even with pending agent intents
-- Manual commands take precedence over agent intents
-- Agent intents are processed only during filesystem watching
-- No conflicts arise between manual and agent operations
+## Intent Format
+```json
+{
+    "prompt": "user's request",
+    "summary": "what you changed"
+}
+```
 
-This system ensures that agents can work efficiently while maintaining the core stem principle: nodes are created only when intent is explicitly declared.
+## Example
+User: "Add login form"
+
+Intent file:
+```json
+{
+    "prompt": "add login form",
+    "summary": "Added LoginForm.jsx with validation"
+}
+```
+
+Then the system records the intent, waits for changes, and creates a node.
+
+## Rules
+- Only write intent if you will change code
+- No intent → no node
+- Agent suggestions are non-authoritative
+ - After any `stem jump`, read `.git/stem/context/current.json`
 """
     
     try:
@@ -130,6 +143,74 @@ This system ensures that agents can work efficiently while maintaining the core 
         return True
     except OSError as e:
         raise OSError(f"Failed to create AGENT.md: {e}")
+
+
+def create_agents_md(force: bool = False) -> bool:
+    """Generate AGENTS.md with short, strict instructions for agents."""
+    agents_md_path = Path("AGENTS.md")
+    if agents_md_path.exists() and not force:
+        return False
+    content = """# Stem Agent Instructions (Read Me First)
+
+If you are an AI coding agent, follow this workflow exactly.
+
+## Workflow
+1. Write intent JSON to `.git/stem/intent/next.json` only if you will change code
+2. Make the code changes
+3. The system auto-creates a stem node after changes complete (idle)
+4. After any `stem jump`, read `.git/stem/context/current.json` to restore context
+5. If unsure, read `.git/stem/context/agent_prompt.txt` for strict system rules
+
+## Intent JSON format
+```json
+{
+  "prompt": "why you are changing code",
+  "summary": "what you changed"
+}
+```
+
+## Rules
+- Do not write intent for discussion-only prompts
+- Summary is WHAT, never WHY
+- Git remains source of truth; do not run stem commands unless asked
+"""
+    try:
+        action = "Updated" if agents_md_path.exists() else "Created"
+        with open(agents_md_path, "w", encoding="utf-8") as f:
+            f.write(content)
+        print(f"{action} AGENTS.md with integration rules")
+        return True
+    except OSError as e:
+        raise OSError(f"Failed to create AGENTS.md: {e}")
+
+
+def get_agent_prompt_text() -> str:
+    """Return strict agent prompt instructions for system prompts."""
+    return """You are an AI coding agent working inside a Git repo using stem.
+
+Core rules:
+1) Only write intent JSON if you will change code.
+2) If the user request is discussion-only, do NOT write intent JSON.
+3) Intent JSON goes to `.git/stem/intent/next.json` with:
+   - prompt: WHY you are changing code
+   - summary: WHAT you changed (never WHY)
+4) After any `stem jump`, read `.git/stem/context/current.json` to restore context.
+5) Do not run stem commands unless the user asks.
+
+When you will change code:
+- Write intent JSON first.
+- Make code changes.
+- The system auto-creates a stem node after changes complete.
+"""
+
+
+def write_agent_prompt_file() -> Path:
+    """Write agent prompt instructions to .git/stem/context/agent_prompt.txt."""
+    context_dir = Path(".git") / "stem" / "context"
+    context_dir.mkdir(parents=True, exist_ok=True)
+    path = context_dir / "agent_prompt.txt"
+    path.write_text(get_agent_prompt_text(), encoding="utf-8")
+    return path
 
 
 def read_agent_intent() -> Optional[AgentIntent]:
@@ -222,26 +303,64 @@ def ensure_intent_directory() -> None:
     intent_dir.mkdir(parents=True, exist_ok=True)
 
 
-def process_agent_intent() -> Optional[Dict[str, str]]:
-    """Process pending agent intent and return branch parameters.
+def process_agent_intent() -> Optional[int]:
+    """Process pending agent intent and record as a suggestion.
     
-    Reads agent intent, validates it, and returns the parameters needed
-    to create a stem branch. This function is called by the filesystem
-    watcher when changes are detected.
+    Reads agent intent, validates it, and records a pending intent.
+    Auto-branching is handled by the watcher when changes are present.
     
     Returns:
-        Optional[Dict[str, str]]: Dict with 'prompt' and optional 'summary' keys,
-                                 or None if no valid intent exists
+        Optional[int]: The recorded intent ID, or None if no valid intent exists
     """
     intent = read_agent_intent()
     if intent is None:
         return None
     
-    result = {'prompt': intent.prompt}
-    if intent.summary:
-        result['summary'] = intent.summary
+    from . import state
+    return state.suggest_intent(intent.prompt, intent.summary, source="agent_file")
+
+
+def create_agent_intent(prompt: str, summary: str) -> bool:
+    """Create agent intent JSON file for suggestion-only processing.
     
-    return result
+    This is a helper function that agents can use to declare their intent
+    before making changes. The intent must be explicitly confirmed by
+    a user before any node is created.
+    
+    Args:
+        prompt: The reason for making changes (WHY)
+        summary: Brief description of what will be changed (WHAT)
+        
+    Returns:
+        bool: True if intent was created successfully
+        
+    Raises:
+        OSError: If intent file cannot be created
+    """
+    try:
+        # Ensure intent directory exists
+        ensure_intent_directory()
+        
+        # Create intent data
+        intent_data = {
+            "prompt": prompt.strip(),
+            "summary": summary.strip() if summary else None
+        }
+        
+        # Remove None values
+        intent_data = {k: v for k, v in intent_data.items() if v is not None}
+        
+        # Write intent file
+        intent_path = Path(".git/stem/intent/next.json")
+        with open(intent_path, 'w', encoding='utf-8') as f:
+            json.dump(intent_data, f, indent=2)
+        
+        print(f"Created agent intent: {prompt}")
+        return True
+        
+    except Exception as e:
+        print(f"Failed to create agent intent: {e}")
+        return False
 
 
 def has_pending_intent() -> bool:

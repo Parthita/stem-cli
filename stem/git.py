@@ -54,12 +54,17 @@ def _run_git_command(args: list[str], cwd: Optional[str] = None, check_output: b
                 ["git"] + args,
                 cwd=cwd,
                 check=True,
-                capture_output=True
+                capture_output=True,
+                text=True
             )
             return ""
     except subprocess.CalledProcessError as e:
-        # Parse stderr for specific error types
-        error_msg = e.stderr.strip() if e.stderr else str(e)
+        # Parse stderr for specific error types, also check stdout
+        error_msg = e.stderr.strip() if e.stderr else ""
+        if not error_msg and e.stdout:
+            error_msg = e.stdout.strip()
+        if not error_msg:
+            error_msg = str(e)
         
         # Handle specific Git error scenarios
         if "not a git repository" in error_msg.lower():
@@ -74,7 +79,7 @@ def _run_git_command(args: list[str], cwd: Optional[str] = None, check_output: b
         if "your local changes" in error_msg.lower() and "overwritten" in error_msg.lower():
             raise GitCheckoutError(f"Cannot checkout: working tree has uncommitted changes")
         
-        if "nothing to commit" in error_msg.lower():
+        if "nothing to commit" in error_msg.lower() or "working tree clean" in error_msg.lower():
             raise GitCommitError("No changes to commit")
         
         if "detached head" in error_msg.lower():
@@ -98,6 +103,28 @@ def init_repo(path: str) -> None:
     
     try:
         _run_git_command(["init"], cwd=str(repo_path))
+        
+        # Create an initial commit so we can create branches
+        # Check if there are any files to commit
+        try:
+            # Add all files in the directory
+            _run_git_command(["add", "."], cwd=str(repo_path))
+            
+            # Try to create initial commit
+            try:
+                _run_git_command(["commit", "-m", "Initial commit"], cwd=str(repo_path))
+            except GitError:
+                # If commit fails (no files), create an empty commit
+                _run_git_command(["commit", "--allow-empty", "-m", "Initial commit"], cwd=str(repo_path))
+                
+        except GitError:
+            # If adding files fails, just create an empty commit
+            try:
+                _run_git_command(["commit", "--allow-empty", "-m", "Initial commit"], cwd=str(repo_path))
+            except GitError:
+                # If even empty commit fails, that's okay - we'll handle it later
+                pass
+                
     except GitError as e:
         raise GitError(f"Failed to initialize Git repository at {repo_path}: {e}")
 
@@ -120,6 +147,10 @@ def _validate_repo(path: str) -> None:
 def is_repo_clean() -> bool:
     """Check if working tree is clean."""
     try:
+        # First check if we're in a git repository
+        if not _is_git_repo(os.getcwd()):
+            return True  # Not in a git repo, consider it "clean"
+        
         # Check for staged changes
         try:
             _run_git_command(["diff-index", "--quiet", "--cached", "HEAD"])
@@ -153,6 +184,10 @@ def is_repo_clean() -> bool:
 def is_detached_head() -> bool:
     """Check if repository is in detached HEAD state."""
     try:
+        # First check if we're in a git repository
+        if not _is_git_repo(os.getcwd()):
+            return False  # Not in a git repo, so not detached HEAD
+        
         # Try to get current branch name
         branch = _run_git_command(["branch", "--show-current"], check_output=True)
         return not branch.strip()  # Empty string means detached HEAD
@@ -164,6 +199,9 @@ def is_detached_head() -> bool:
 def get_detached_head_info() -> dict:
     """Get information about detached HEAD state for recovery guidance."""
     try:
+        # First validate we're in a git repository
+        _validate_repo(os.getcwd())
+        
         # Get current commit hash
         commit_hash = _run_git_command(["rev-parse", "HEAD"], check_output=True)
         
@@ -177,13 +215,16 @@ def get_detached_head_info() -> dict:
             stem_branches = [b for b in branches if b.startswith('stem/')]
         except GitError:
             stem_branches = []
+            branches = []
         
         return {
             'commit_hash': commit_hash,
             'commit_message': commit_msg,
             'stem_branches': stem_branches,
-            'all_branches': branches if 'branches' in locals() else []
+            'all_branches': branches
         }
+    except GitRepositoryError as e:
+        raise GitRepositoryError(f"Cannot get detached HEAD information: {e}")
     except GitError as e:
         raise GitRepositoryError(f"Cannot get detached HEAD information: {e}")
 
@@ -249,7 +290,7 @@ def branch_exists(branch_name: str) -> bool:
 
 
 def get_missing_branches_info() -> dict:
-    """Get information about missing stem branches referenced in nodes.json."""
+    """Get information about missing stem branches referenced in stem metadata."""
     try:
         from . import state
         
@@ -367,18 +408,29 @@ def create_branch(branch_name: str) -> None:
         GitBranchError: If branch creation fails
         GitRepositoryError: If repository is in invalid state
     """
-    # Check for detached HEAD state first
+    # First validate we're in a git repository
+    if not _is_git_repo(os.getcwd()):
+        raise GitRepositoryError(f"Not in a Git repository. Initialize with 'git init' or 'stem create' first.")
+    
+    # Check for detached HEAD state
     if is_detached_head():
-        recovery_msg = suggest_detached_head_recovery()
-        raise GitRepositoryError(f"Cannot create branch in detached HEAD state.\n\n{recovery_msg}")
+        try:
+            recovery_msg = suggest_detached_head_recovery()
+            raise GitRepositoryError(f"Cannot create branch in detached HEAD state.\n\n{recovery_msg}")
+        except GitRepositoryError as detached_error:
+            # If we can't get recovery suggestions, provide basic guidance
+            raise GitRepositoryError("Cannot create branch in detached HEAD state. Use 'git checkout main' or 'git checkout -b <branch-name>' to create a new branch first.")
     
     # Check if branch already exists
     if branch_exists(branch_name):
         raise GitBranchError(f"Branch '{branch_name}' already exists")
     
-    # Validate working tree is clean
+    # Auto-stage any uncommitted changes before creating branch
     if not is_repo_clean():
-        raise GitCheckoutError("Cannot create branch: working tree has uncommitted changes")
+        try:
+            stage_all_changes()
+        except GitError as e:
+            raise GitCheckoutError(f"Cannot stage changes before creating branch: {e}")
     
     try:
         # Create and checkout the new branch
@@ -508,6 +560,7 @@ def commit_staged_changes(message: str) -> str:
     """Create commit from staged changes and return commit hash.
     
     Creates a commit from currently staged changes with the given message.
+    If there are no staged changes, creates an empty commit.
     
     Args:
         message: Commit message
@@ -519,8 +572,21 @@ def commit_staged_changes(message: str) -> str:
         GitError: If commit fails
     """
     try:
-        # Create the commit
-        _run_git_command(["commit", "-m", message])
+        # Try to create the commit
+        try:
+            _run_git_command(["commit", "-m", message])
+        except GitCommitError as e:
+            # If commit fails due to no changes, create an empty commit
+            if "no changes to commit" in str(e).lower():
+                _run_git_command(["commit", "--allow-empty", "-m", message])
+            else:
+                raise e
+        except GitError as e:
+            # Handle other git errors that might indicate no changes
+            if "nothing to commit" in str(e).lower() or "no changes added to commit" in str(e).lower():
+                _run_git_command(["commit", "--allow-empty", "-m", message])
+            else:
+                raise e
         
         # Get the commit hash
         commit_hash = _run_git_command(["rev-parse", "HEAD"], check_output=True)

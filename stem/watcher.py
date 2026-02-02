@@ -3,7 +3,7 @@ Watcher Layer - Filesystem monitoring and idle detection.
 
 Monitors filesystem changes using watchdog, implements idle detection,
 and triggers auto-commits when nodes exist. Integrates with agent
-intent system to automatically create nodes when agents declare intent.
+intent system to record intent suggestions.
 """
 
 import os
@@ -98,6 +98,75 @@ class StemFileSystemEventHandler(FileSystemEventHandler):
             self.idle_timer = None
 
 
+def start_background_watcher(path: str, idle_timeout: int = 3) -> int:
+    """Start filesystem watcher as a background subprocess.
+    
+    Args:
+        path: Directory path to monitor
+        idle_timeout: Seconds to wait after last change before triggering auto-commit
+        
+    Returns:
+        int: Process ID of the background watcher, or 0 if failed
+    """
+    import subprocess
+    import sys
+    
+    try:
+        # Start watcher as background subprocess
+        process = subprocess.Popen([
+            sys.executable, '-m', 'stem.watcher',
+            '--path', path,
+            '--timeout', str(idle_timeout)
+        ], 
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True  # Detach from parent process
+        )
+        
+        return process.pid
+        
+    except Exception as e:
+        print(f"Failed to start background watcher: {e}")
+        return 0
+
+
+def stop_background_watcher(pid: int) -> bool:
+    """Stop background watcher process.
+    
+    Args:
+        pid: Process ID of the watcher to stop
+        
+    Returns:
+        bool: True if successfully stopped
+    """
+    import os
+    import signal
+    
+    try:
+        os.kill(pid, signal.SIGTERM)
+        return True
+    except (OSError, ProcessLookupError):
+        return False
+
+
+def is_watcher_running(pid: int) -> bool:
+    """Check if watcher process is still running.
+    
+    Args:
+        pid: Process ID to check
+        
+    Returns:
+        bool: True if process is running
+    """
+    import os
+    
+    try:
+        os.kill(pid, 0)  # Signal 0 just checks if process exists
+        return True
+    except (OSError, ProcessLookupError):
+        return False
+
+
 def start_watching(path: str, idle_timeout: int = 3) -> None:
     """Start filesystem monitoring with idle detection.
     
@@ -176,40 +245,42 @@ def auto_commit_if_needed() -> None:
     """Trigger auto-commit only when nodes exist, with agent integration.
     
     This function implements the core auto-commit logic with agent integration:
-    1. Check for agent intent and process it if present
-    2. Check if any nodes exist (if not, do nothing unless agent intent exists)
-    3. Check if working tree is dirty (if clean, do nothing)  
-    4. Create exactly one commit per node
+    1. Check for agent intent and record it as a suggestion if present
+    2. If a pending agent intent exists and repo is dirty, auto-create a node
+    3. Check if any nodes exist (if not, do nothing)
+    4. Check if working tree is dirty (if clean, do nothing)  
+    5. Create exactly one commit per node
     
     Agent integration ensures that:
-    - Agent intents are processed to create nodes automatically
-    - Agent-provided summaries are preferred over git diff
+    - Agent intents are recorded and auto-create nodes only after changes are present
     - Manual stem branch always works regardless of agent state
     
     Raises:
         Exception: If auto-commit fails
     """
     try:
-        # First, check for agent intent and process it - requirements 4.4, 4.5
-        agent_intent_data = agent.process_agent_intent()
-        
-        if agent_intent_data:
-            # Agent has declared intent, create a new node
-            prompt = agent_intent_data['prompt']
-            agent_summary = agent_intent_data.get('summary')
-            
-            print(f"Processing agent intent: {prompt}")
-            
-            # Use internal branch function to create the node
-            success = internal_branch(prompt, agent_summary)
-            
+        # First, check for agent intent and record it as a suggestion
+        intent_id = agent.process_agent_intent()
+        if intent_id:
+            print(f"Recorded agent intent suggestion (id: {intent_id}). Awaiting changes.")
+
+        # Auto-branch from pending agent intent when changes are present
+        from . import state
+        pending = state.get_pending_intent_by_source("agent_file")
+        if pending and not is_repo_clean():
+            confirmed = state.confirm_intent(int(pending["id"]))
+            prompt = confirmed["prompt"]
+            summary = confirmed.get("summary")
+            success = internal_branch(prompt, summary, intent_id=int(pending["id"]))
             if success:
                 print(f"Created node from agent intent: {prompt}")
-                # After creating node, continue with normal auto-commit logic
-                # to handle any additional changes
             else:
-                print(f"Failed to create node from agent intent: {prompt}")
-                return
+                state.log_anomaly(
+                    "intent_auto_branch_failed",
+                    {"intent_id": int(pending["id"]), "prompt": prompt},
+                    node_id=None,
+                )
+            return
         
         # Check if any nodes exist - requirement 3.7
         state = load_state()
@@ -254,3 +325,22 @@ def auto_commit_if_needed() -> None:
     except Exception as e:
         # Re-raise with context
         raise Exception(f"Auto-commit failed: {e}")
+
+
+if __name__ == "__main__":
+    import argparse
+    import sys
+    
+    parser = argparse.ArgumentParser(description="Stem filesystem watcher")
+    parser.add_argument("--path", required=True, help="Directory path to monitor")
+    parser.add_argument("--timeout", type=int, default=3, help="Idle timeout in seconds")
+    
+    args = parser.parse_args()
+    
+    try:
+        start_watching(args.path, args.timeout)
+    except KeyboardInterrupt:
+        sys.exit(0)
+    except Exception as e:
+        print(f"Watcher failed: {e}")
+        sys.exit(1)

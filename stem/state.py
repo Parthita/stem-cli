@@ -1,18 +1,18 @@
 """
 State Layer - Manage stem metadata and node tracking.
 
-Handles reading/writing nodes.json, generating sequential node IDs,
-tracking node relationships and head pointer.
+SQLite-backed store for nodes, events, prompts, and head tracking.
 """
+
+from __future__ import annotations
 
 import json
 import os
-import shutil
-import tempfile
+import sqlite3
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, Optional
-from dataclasses import dataclass, asdict
-from datetime import datetime
+from typing import Dict, Optional, Iterable, Any, List
 
 
 class StateError(Exception):
@@ -38,461 +38,658 @@ class Node:
     prompt: str
     summary: str
     ref: str
-    created_at: datetime
+    created_at: str
+    status: str
 
 
-@dataclass
-class StemState:
-    """Represents the complete state of a stem repository."""
-    counter: int
-    head: Optional[str]
-    nodes: Dict[str, Node]
-    
-    def next_id(self) -> str:
-        """Generate next sequential node ID."""
-        self.counter += 1
-        return f"{self.counter:03d}"
+def _stem_dir() -> Path:
+    return Path(".git") / "stem"
+
+
+def _db_path() -> Path:
+    return _stem_dir() / "stem.db"
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _connect() -> sqlite3.Connection:
+    try:
+        conn = sqlite3.connect(_db_path())
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA foreign_keys = ON")
+        conn.execute("PRAGMA journal_mode = WAL")
+        conn.execute("PRAGMA synchronous = NORMAL")
+        return conn
+    except sqlite3.Error as e:
+        raise StateError(f"Failed to connect to state database: {e}")
+
+
+def ensure_db() -> None:
+    """Ensure the stem database exists and is initialized."""
+    stem_dir = _stem_dir()
+    stem_dir.mkdir(parents=True, exist_ok=True)
+
+    needs_create = not _db_path().exists()
+    conn = _connect()
+    try:
+        _create_tables(conn)
+        _ensure_meta_defaults(conn)
+        if needs_create:
+            _migrate_nodes_json_if_present(conn)
+    finally:
+        conn.close()
+
+
+def _create_tables(conn: sqlite3.Connection) -> None:
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS meta (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS nodes (
+            id TEXT PRIMARY KEY,
+            parent_id TEXT NULL,
+            prompt TEXT NOT NULL,
+            summary TEXT NOT NULL,
+            ref TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            status TEXT NOT NULL CHECK(status IN ('active', 'invalid')),
+            FOREIGN KEY(parent_id) REFERENCES nodes(id)
+        );
+
+        CREATE TABLE IF NOT EXISTS events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            node_id TEXT NULL,
+            event_type TEXT NOT NULL,
+            payload_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY(node_id) REFERENCES nodes(id)
+        );
+
+        CREATE TABLE IF NOT EXISTS prompts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            node_id TEXT NOT NULL,
+            role TEXT NOT NULL,
+            content TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY(node_id) REFERENCES nodes(id)
+        );
+
+        CREATE TABLE IF NOT EXISTS agent_intents (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            prompt TEXT NOT NULL,
+            summary TEXT NULL,
+            status TEXT NOT NULL CHECK(status IN ('pending', 'confirmed', 'rejected')),
+            source TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            node_id TEXT NULL,
+            FOREIGN KEY(node_id) REFERENCES nodes(id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_nodes_parent ON nodes(parent_id);
+        CREATE INDEX IF NOT EXISTS idx_nodes_status ON nodes(status);
+        CREATE INDEX IF NOT EXISTS idx_events_node ON events(node_id);
+        CREATE INDEX IF NOT EXISTS idx_events_created ON events(created_at);
+        CREATE INDEX IF NOT EXISTS idx_prompts_node ON prompts(node_id);
+        CREATE INDEX IF NOT EXISTS idx_prompts_created ON prompts(created_at);
+        CREATE INDEX IF NOT EXISTS idx_agent_intents_status ON agent_intents(status);
+        CREATE INDEX IF NOT EXISTS idx_agent_intents_created ON agent_intents(created_at);
+        """
+    )
+    conn.commit()
+
+
+def _ensure_meta_defaults(conn: sqlite3.Connection) -> None:
+    existing = {row["key"] for row in conn.execute("SELECT key FROM meta")}
+    if "counter" not in existing:
+        conn.execute("INSERT INTO meta (key, value) VALUES (?, ?)", ("counter", "0"))
+    if "head" not in existing:
+        conn.execute("INSERT INTO meta (key, value) VALUES (?, ?)", ("head", ""))
+    conn.commit()
+
+
+def _get_meta(conn: sqlite3.Connection, key: str) -> str:
+    row = conn.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
+    return row["value"] if row else ""
+
+
+def _set_meta(conn: sqlite3.Connection, key: str, value: str) -> None:
+    conn.execute(
+        "INSERT INTO meta (key, value) VALUES (?, ?) "
+        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        (key, value),
+    )
+
+
+def _record_event(conn: sqlite3.Connection, event_type: str, payload: Dict[str, Any], node_id: Optional[str] = None) -> None:
+    conn.execute(
+        "INSERT INTO events (node_id, event_type, payload_json, created_at) VALUES (?, ?, ?, ?)",
+        (node_id, event_type, json.dumps(payload, ensure_ascii=False), _now_iso()),
+    )
+
+
+def _migrate_nodes_json_if_present(conn: sqlite3.Connection) -> None:
+    nodes_file = _stem_dir() / "nodes.json"
+    if not nodes_file.exists():
+        return
+
+    try:
+        with open(nodes_file, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        return
+
+    nodes = data.get("nodes") if isinstance(data, dict) else None
+    if not isinstance(nodes, dict):
+        return
+
+    # Avoid duplicate migration if db already has nodes
+    existing_count = conn.execute("SELECT COUNT(*) AS c FROM nodes").fetchone()["c"]
+    if existing_count > 0:
+        return
+
+    now = _now_iso()
+    # Insert nodes in id order for stable parent resolution
+    for node_id in sorted(nodes.keys()):
+        node = nodes[node_id]
+        if not isinstance(node, dict):
+            continue
+        parent = node.get("parent")
+        if parent is not None and parent not in nodes:
+            parent = None
+        prompt = node.get("prompt") if isinstance(node.get("prompt"), str) else "Recovered node"
+        summary = node.get("summary") if isinstance(node.get("summary"), str) else "Summary lost during migration"
+        ref = node.get("ref") if isinstance(node.get("ref"), str) else f"refs/heads/stem/unknown/{node_id}"
+
+        conn.execute(
+            "INSERT INTO nodes (id, parent_id, prompt, summary, ref, created_at, status) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (node_id, parent, prompt, summary, ref, now, "active"),
+        )
+        _record_event(conn, "node_migrated", {"source": "nodes.json"}, node_id=node_id)
+
+    # Restore meta
+    counter = data.get("counter") if isinstance(data.get("counter"), int) else 0
+    if counter < 0:
+        counter = 0
+    _set_meta(conn, "counter", str(counter))
+    head = data.get("head") if isinstance(data.get("head"), str) else ""
+    if head and head not in nodes:
+        head = ""
+    _set_meta(conn, "head", head)
+    conn.commit()
 
 
 def load_state() -> Dict:
-    """Read nodes.json atomically with validation and corruption detection."""
-    stem_dir = Path(".git/stem")
-    nodes_file = stem_dir / "nodes.json"
-    backup_file = stem_dir / "nodes.json.backup"
-    
-    # If nodes.json doesn't exist, return empty state
-    if not nodes_file.exists():
-        return {
-            "counter": 0,
-            "head": None,
-            "nodes": {}
-        }
-    
-    # Try to load the main file
+    """Return a compatibility state dict from SQLite."""
+    ensure_db()
+    conn = _connect()
     try:
-        with open(nodes_file, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-        
-        # Validate the loaded state
-        validation_result = _validate_state_detailed(data)
-        if validation_result['valid']:
-            return data
-        else:
-            raise StateValidationError(f"Invalid state structure: {validation_result['errors']}")
-            
-    except (json.JSONDecodeError, StateValidationError, KeyError) as e:
-        print(f"Warning: nodes.json is corrupted ({e})")
-        
-        # Try to recover from backup
-        recovery_attempted = False
-        if backup_file.exists():
-            try:
-                print("Attempting recovery from backup...")
-                with open(backup_file, 'r', encoding='utf-8') as f:
-                    backup_data = json.load(f)
-                
-                backup_validation = _validate_state_detailed(backup_data)
-                if backup_validation['valid']:
-                    print("Successfully recovered from backup")
-                    # Restore the main file from backup
-                    shutil.copy2(backup_file, nodes_file)
-                    recovery_attempted = True
-                    return backup_data
-                else:
-                    print(f"Backup is also corrupted: {backup_validation['errors']}")
-            except Exception as backup_error:
-                print(f"Failed to recover from backup: {backup_error}")
-        
-        # Try to repair the corrupted state
-        if not recovery_attempted:
-            try:
-                print("Attempting to repair corrupted state...")
-                repaired_state = _attempt_state_repair(nodes_file)
-                if repaired_state:
-                    print("Successfully repaired state")
-                    return repaired_state
-            except Exception as repair_error:
-                print(f"State repair failed: {repair_error}")
-        
-        # If all recovery attempts fail, return empty state and create backup of corrupted file
-        corrupted_file = stem_dir / f"nodes.json.corrupted.{int(datetime.now().timestamp())}"
-        if nodes_file.exists():
-            shutil.copy2(nodes_file, corrupted_file)
-            print(f"Corrupted file saved as: {corrupted_file}")
-        
-        print("Starting with empty state")
-        return {
-            "counter": 0,
-            "head": None,
-            "nodes": {}
-        }
+        counter = int(_get_meta(conn, "counter") or "0")
+        head = _get_meta(conn, "head") or None
+        nodes: Dict[str, Dict[str, Any]] = {}
+        rows = conn.execute(
+            "SELECT id, parent_id, prompt, summary, ref, created_at, status FROM nodes ORDER BY id"
+        ).fetchall()
+        for row in rows:
+            nodes[row["id"]] = {
+                "parent": row["parent_id"],
+                "prompt": row["prompt"],
+                "summary": row["summary"],
+                "ref": row["ref"],
+                "created_at": row["created_at"],
+                "status": row["status"],
+            }
+        return {"counter": counter, "head": head, "nodes": nodes}
+    finally:
+        conn.close()
 
 
-def save_state(state: Dict) -> None:
-    """Write nodes.json atomically with backup mechanism and rollback on failure."""
-    stem_dir = Path(".git/stem")
-    nodes_file = stem_dir / "nodes.json"
-    backup_file = stem_dir / "nodes.json.backup"
-    
-    # Ensure stem directory exists
-    stem_dir.mkdir(parents=True, exist_ok=True)
-    
-    # Validate state before saving
-    validation_result = _validate_state_detailed(state)
-    if not validation_result['valid']:
-        raise StateValidationError(f"Invalid state structure - refusing to save corrupted data: {validation_result['errors']}")
-    
-    # Store original file for rollback if needed
-    original_backup = None
-    if nodes_file.exists():
-        try:
-            # Create backup of existing file
-            shutil.copy2(nodes_file, backup_file)
-            # Also keep a temporary copy for rollback
-            original_backup = stem_dir / f"nodes.json.original.{int(datetime.now().timestamp())}"
-            shutil.copy2(nodes_file, original_backup)
-        except Exception as e:
-            print(f"Warning: Failed to create backup: {e}")
-    
-    # Write to temporary file first for atomic operation
-    temp_file = None
-    try:
-        with tempfile.NamedTemporaryFile(
-            mode='w', 
-            encoding='utf-8', 
-            dir=stem_dir, 
-            delete=False,
-            suffix='.tmp'
-        ) as tmp_file:
-            json.dump(state, tmp_file, indent=2, ensure_ascii=False)
-            tmp_file.flush()
-            os.fsync(tmp_file.fileno())  # Force write to disk
-            temp_file = tmp_file.name
-        
-        # Validate the written file before committing
-        try:
-            with open(temp_file, 'r', encoding='utf-8') as f:
-                written_data = json.load(f)
-            
-            written_validation = _validate_state_detailed(written_data)
-            if not written_validation['valid']:
-                raise StateValidationError(f"Written file validation failed: {written_validation['errors']}")
-                
-        except Exception as e:
-            raise StateCorruptionError(f"Failed to validate written state file: {e}")
-        
-        # Atomic move to final location
-        try:
-            if os.name == 'nt':  # Windows
-                if nodes_file.exists():
-                    nodes_file.unlink()
-            shutil.move(temp_file, nodes_file)
-            temp_file = None  # Successfully moved
-            
-        except Exception as e:
-            raise StateCorruptionError(f"Failed to save state atomically: {e}")
-        
-        # Clean up original backup on success
-        if original_backup and original_backup.exists():
-            try:
-                original_backup.unlink()
-            except:
-                pass  # Ignore cleanup errors
-                
-    except Exception as e:
-        # Rollback on any failure
-        try:
-            # Clean up temp file if it exists
-            if temp_file and os.path.exists(temp_file):
-                os.unlink(temp_file)
-            
-            # Restore original file if we have a backup
-            if original_backup and original_backup.exists() and not nodes_file.exists():
-                shutil.copy2(original_backup, nodes_file)
-                print("Rolled back to original state after save failure")
-                
-        except Exception as rollback_error:
-            print(f"Warning: Rollback failed: {rollback_error}")
-        
-        # Clean up rollback backup
-        if original_backup and original_backup.exists():
-            try:
-                original_backup.unlink()
-            except:
-                pass
-        
-        # Re-raise the original error
-        raise StateCorruptionError(f"Failed to save state: {e}")
-
-
-def create_node(prompt: str, summary: str, ref: str, parent: str) -> str:
-    """Create new node and return node ID."""
-    # Load current state
-    state = load_state()
-    
-    # Generate next sequential ID
-    state["counter"] += 1
-    node_id = f"{state['counter']:03d}"
-    
-    # Create the new node
-    state["nodes"][node_id] = {
-        "parent": parent,
-        "prompt": prompt,
-        "summary": summary,
-        "ref": ref
-    }
-    
-    # Update head to point to new node
-    state["head"] = node_id
-    
-    # Save updated state
-    save_state(state)
-    
-    return node_id
+def get_all_nodes() -> Dict[str, Dict[str, Any]]:
+    """Get all nodes in the current repository."""
+    return load_state()["nodes"]
 
 
 def get_next_id() -> str:
     """Generate sequential node ID without creating a node."""
-    state = load_state()
-    next_counter = state["counter"] + 1
-    return f"{next_counter:03d}"
+    ensure_db()
+    conn = _connect()
+    try:
+        counter = int(_get_meta(conn, "counter") or "0") + 1
+        return f"{counter:03d}"
+    finally:
+        conn.close()
+
+
+def create_node(prompt: str, summary: str, ref: str, parent: Optional[str]) -> str:
+    """Create new node and return node ID."""
+    ensure_db()
+    conn = _connect()
+    try:
+        conn.execute("BEGIN")
+        counter = int(_get_meta(conn, "counter") or "0") + 1
+        node_id = f"{counter:03d}"
+
+        if parent is not None:
+            exists = conn.execute("SELECT 1 FROM nodes WHERE id = ?", (parent,)).fetchone()
+            if not exists:
+                raise StateValidationError(f"Parent node does not exist: {parent}")
+
+        conn.execute(
+            "INSERT INTO nodes (id, parent_id, prompt, summary, ref, created_at, status) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (node_id, parent, prompt, summary, ref, _now_iso(), "active"),
+        )
+        _set_meta(conn, "counter", str(counter))
+        _set_meta(conn, "head", node_id)
+
+        _record_event(conn, "node_created", {"prompt": prompt, "ref": ref, "parent": parent}, node_id=node_id)
+        _record_event(conn, "head_updated", {"head": node_id}, node_id=node_id)
+
+        conn.commit()
+        return node_id
+    except sqlite3.Error as e:
+        conn.rollback()
+        raise StateError(f"Failed to create node: {e}")
+    finally:
+        conn.close()
 
 
 def update_head(node_id: str) -> None:
     """Update head pointer to specified node."""
-    state = load_state()
-    
-    # Validate that the node exists
-    if node_id not in state["nodes"]:
-        raise ValueError(f"Node {node_id} does not exist")
-    
-    # Update head pointer
-    state["head"] = node_id
-    
-    # Save updated state
-    save_state(state)
+    ensure_db()
+    conn = _connect()
+    try:
+        exists = conn.execute("SELECT 1 FROM nodes WHERE id = ?", (node_id,)).fetchone()
+        if not exists:
+            raise StateValidationError(f"Node {node_id} does not exist")
+        _set_meta(conn, "head", node_id)
+        _record_event(conn, "head_updated", {"head": node_id}, node_id=node_id)
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def get_current_head() -> Optional[str]:
     """Get the current head node ID."""
-    state = load_state()
-    return state["head"]
-
-
-def get_all_nodes() -> Dict[str, Dict]:
-    """Get all nodes in the current repository."""
-    state = load_state()
-    return state["nodes"]
-
-
-def _validate_state_detailed(state: Dict) -> dict:
-    """Validate the structure and content of a state dictionary with detailed error reporting."""
-    errors = []
-    
+    ensure_db()
+    conn = _connect()
     try:
-        # Check required top-level keys
-        required_keys = {"counter", "head", "nodes"}
-        missing_keys = required_keys - set(state.keys())
-        if missing_keys:
-            errors.append(f"Missing required keys: {missing_keys}")
-        
-        # Validate counter
-        if "counter" in state:
-            if not isinstance(state["counter"], int):
-                errors.append(f"Counter must be integer, got {type(state['counter'])}")
-            elif state["counter"] < 0:
-                errors.append(f"Counter must be non-negative, got {state['counter']}")
-        
-        # Validate head (can be None or string)
-        if "head" in state:
-            if state["head"] is not None and not isinstance(state["head"], str):
-                errors.append(f"Head must be None or string, got {type(state['head'])}")
-        
-        # Validate nodes dictionary
-        if "nodes" in state:
-            if not isinstance(state["nodes"], dict):
-                errors.append(f"Nodes must be dictionary, got {type(state['nodes'])}")
-            else:
-                # Validate each node
-                for node_id, node_data in state["nodes"].items():
-                    if not isinstance(node_id, str):
-                        errors.append(f"Node ID must be string, got {type(node_id)} for {node_id}")
-                        continue
-                    
-                    if not isinstance(node_data, dict):
-                        errors.append(f"Node data must be dictionary for node {node_id}")
-                        continue
-                    
-                    # Check required node fields
-                    required_node_keys = {"parent", "prompt", "summary", "ref"}
-                    missing_node_keys = required_node_keys - set(node_data.keys())
-                    if missing_node_keys:
-                        errors.append(f"Node {node_id} missing keys: {missing_node_keys}")
-                    
-                    # Validate node field types
-                    if "parent" in node_data:
-                        if node_data["parent"] is not None and not isinstance(node_data["parent"], str):
-                            errors.append(f"Node {node_id} parent must be None or string")
-                    
-                    if "prompt" in node_data and not isinstance(node_data["prompt"], str):
-                        errors.append(f"Node {node_id} prompt must be string")
-                    
-                    if "summary" in node_data and not isinstance(node_data["summary"], str):
-                        errors.append(f"Node {node_id} summary must be string")
-                    
-                    if "ref" in node_data and not isinstance(node_data["ref"], str):
-                        errors.append(f"Node {node_id} ref must be string")
-        
-        # Cross-reference validation
-        if "head" in state and "nodes" in state:
-            # Validate head points to existing node (if not None)
-            if state["head"] is not None and state["head"] not in state["nodes"]:
-                errors.append(f"Head points to non-existent node: {state['head']}")
-        
-        if "nodes" in state and isinstance(state["nodes"], dict):
-            # Validate parent references point to existing nodes
-            for node_id, node_data in state["nodes"].items():
-                if isinstance(node_data, dict) and "parent" in node_data:
-                    if node_data["parent"] is not None and node_data["parent"] not in state["nodes"]:
-                        errors.append(f"Node {node_id} parent points to non-existent node: {node_data['parent']}")
-        
-        return {
-            'valid': len(errors) == 0,
-            'errors': errors
-        }
-        
-    except Exception as e:
-        return {
-            'valid': False,
-            'errors': [f"Validation exception: {e}"]
-        }
+        head = _get_meta(conn, "head")
+        return head or None
+    finally:
+        conn.close()
 
 
-def _attempt_state_repair(nodes_file: Path) -> Optional[Dict]:
-    """Attempt to repair a corrupted state file by fixing common issues."""
+def invalidate_node(node_id: str, reason: str) -> None:
+    """Mark a node invalid via event (no deletion)."""
+    ensure_db()
+    conn = _connect()
     try:
-        # Try to load the raw JSON first
-        with open(nodes_file, 'r', encoding='utf-8') as f:
-            raw_data = json.load(f)
-        
-        # Start with a clean state template
-        repaired_state = {
-            "counter": 0,
-            "head": None,
-            "nodes": {}
-        }
-        
-        # Try to recover counter
-        if "counter" in raw_data and isinstance(raw_data["counter"], int) and raw_data["counter"] >= 0:
-            repaired_state["counter"] = raw_data["counter"]
-        
-        # Try to recover nodes
-        if "nodes" in raw_data and isinstance(raw_data["nodes"], dict):
-            valid_nodes = {}
-            
-            for node_id, node_data in raw_data["nodes"].items():
-                if not isinstance(node_id, str) or not isinstance(node_data, dict):
-                    continue
-                
-                # Try to repair this node
-                repaired_node = {}
-                
-                # Required fields with defaults
-                repaired_node["parent"] = None
-                repaired_node["prompt"] = "Recovered node"
-                repaired_node["summary"] = "Summary lost during recovery"
-                repaired_node["ref"] = f"refs/heads/stem/unknown/{node_id}"
-                
-                # Try to recover actual values
-                if "parent" in node_data:
-                    if node_data["parent"] is None or isinstance(node_data["parent"], str):
-                        repaired_node["parent"] = node_data["parent"]
-                
-                if "prompt" in node_data and isinstance(node_data["prompt"], str):
-                    repaired_node["prompt"] = node_data["prompt"]
-                
-                if "summary" in node_data and isinstance(node_data["summary"], str):
-                    repaired_node["summary"] = node_data["summary"]
-                
-                if "ref" in node_data and isinstance(node_data["ref"], str):
-                    repaired_node["ref"] = node_data["ref"]
-                
-                valid_nodes[node_id] = repaired_node
-            
-            repaired_state["nodes"] = valid_nodes
-            
-            # Update counter based on recovered nodes
-            if valid_nodes:
-                try:
-                    max_id = max(int(node_id) for node_id in valid_nodes.keys() if node_id.isdigit())
-                    repaired_state["counter"] = max(repaired_state["counter"], max_id)
-                except (ValueError, TypeError):
-                    pass
-        
-        # Try to recover head, but validate it points to existing node
-        if "head" in raw_data and isinstance(raw_data["head"], str):
-            if raw_data["head"] in repaired_state["nodes"]:
-                repaired_state["head"] = raw_data["head"]
-        
-        # Fix parent references that point to non-existent nodes
-        for node_id, node_data in repaired_state["nodes"].items():
-            if node_data["parent"] is not None and node_data["parent"] not in repaired_state["nodes"]:
-                node_data["parent"] = None
-        
-        # Validate the repaired state
-        validation_result = _validate_state_detailed(repaired_state)
-        if validation_result['valid']:
-            # Save the repaired state
-            save_state(repaired_state)
-            return repaired_state
-        else:
-            print(f"Repair validation failed: {validation_result['errors']}")
+        exists = conn.execute("SELECT status FROM nodes WHERE id = ?", (node_id,)).fetchone()
+        if not exists:
+            raise StateValidationError(f"Node {node_id} does not exist")
+        if exists["status"] == "invalid":
+            return
+        conn.execute("UPDATE nodes SET status = 'invalid' WHERE id = ?", (node_id,))
+        _record_event(conn, "node_invalidated", {"reason": reason}, node_id=node_id)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def record_prompt(node_id: str, role: str, content: str) -> None:
+    """Record a prompt for context restoration."""
+    ensure_db()
+    conn = _connect()
+    try:
+        exists = conn.execute("SELECT 1 FROM nodes WHERE id = ?", (node_id,)).fetchone()
+        if not exists:
+            raise StateValidationError(f"Node {node_id} does not exist")
+        conn.execute(
+            "INSERT INTO prompts (node_id, role, content, created_at) VALUES (?, ?, ?, ?)",
+            (node_id, role, content, _now_iso()),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_recent_prompts(node_id: str, limit: int = 10) -> Iterable[Dict[str, str]]:
+    """Fetch recent prompts for a node."""
+    ensure_db()
+    conn = _connect()
+    try:
+        rows = conn.execute(
+            "SELECT role, content, created_at FROM prompts WHERE node_id = ? ORDER BY created_at DESC LIMIT ?",
+            (node_id, limit),
+        ).fetchall()
+        return [dict(row) for row in rows]
+    finally:
+        conn.close()
+
+
+def get_node(node_id: str) -> Optional[Dict[str, Any]]:
+    """Fetch a single node by id."""
+    ensure_db()
+    conn = _connect()
+    try:
+        row = conn.execute(
+            "SELECT id, parent_id, prompt, summary, ref, created_at, status FROM nodes WHERE id = ?",
+            (node_id,),
+        ).fetchone()
+        if not row:
             return None
-            
-    except Exception as e:
-        print(f"State repair exception: {e}")
-        return None
+        return {
+            "id": row["id"],
+            "parent": row["parent_id"],
+            "prompt": row["prompt"],
+            "summary": row["summary"],
+            "ref": row["ref"],
+            "created_at": row["created_at"],
+            "status": row["status"],
+        }
+    finally:
+        conn.close()
+
+
+def get_ancestor_chain(node_id: str, limit: int = 5) -> List[Dict[str, Any]]:
+    """Fetch ancestor chain up to limit (excluding the node itself)."""
+    ensure_db()
+    conn = _connect()
+    chain: List[Dict[str, Any]] = []
+    try:
+        current = conn.execute(
+            "SELECT parent_id FROM nodes WHERE id = ?",
+            (node_id,),
+        ).fetchone()
+        parent_id = current["parent_id"] if current else None
+        while parent_id and len(chain) < limit:
+            row = conn.execute(
+                "SELECT id, parent_id, prompt, summary, ref, created_at, status FROM nodes WHERE id = ?",
+                (parent_id,),
+            ).fetchone()
+            if not row:
+                break
+            chain.append(
+                {
+                    "id": row["id"],
+                    "parent": row["parent_id"],
+                    "prompt": row["prompt"],
+                    "summary": row["summary"],
+                    "ref": row["ref"],
+                    "created_at": row["created_at"],
+                    "status": row["status"],
+                }
+            )
+            parent_id = row["parent_id"]
+        return chain
+    finally:
+        conn.close()
+
+
+def build_context_snapshot(node_id: str, ancestor_limit: int = 5, prompt_limit: int = 10) -> Dict[str, Any]:
+    """Build a read-only context bundle for agents on jump."""
+    ensure_db()
+    node = get_node(node_id)
+    if not node:
+        raise StateValidationError(f"Node {node_id} does not exist")
+    head = get_current_head()
+    bundle = {
+        "generated_at": _now_iso(),
+        "head": head,
+        "node": node,
+        "ancestors": get_ancestor_chain(node_id, limit=ancestor_limit),
+        "recent_prompts": list(get_recent_prompts(node_id, limit=prompt_limit)),
+    }
+    return bundle
+
+
+def write_context_snapshot(node_id: str, ancestor_limit: int = 5, prompt_limit: int = 10) -> Path:
+    """Write a context snapshot to .git/stem/context/current.json."""
+    bundle = build_context_snapshot(node_id, ancestor_limit=ancestor_limit, prompt_limit=prompt_limit)
+    context_dir = _stem_dir() / "context"
+    context_dir.mkdir(parents=True, exist_ok=True)
+    path = context_dir / "current.json"
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(bundle, f, indent=2, ensure_ascii=False)
+    # Log event
+    conn = _connect()
+    try:
+        _record_event(conn, "context_snapshot_written", {"path": str(path)}, node_id=node_id)
+        conn.commit()
+    finally:
+        conn.close()
+    return path
+
+
+def suggest_intent(prompt: str, summary: Optional[str], source: str) -> int:
+    """Record a suggested agent intent and return intent ID."""
+    ensure_db()
+    conn = _connect()
+    try:
+        now = _now_iso()
+        cur = conn.execute(
+            "INSERT INTO agent_intents (prompt, summary, status, source, created_at, updated_at) "
+            "VALUES (?, ?, 'pending', ?, ?, ?)",
+            (prompt, summary, source, now, now),
+        )
+        intent_id = int(cur.lastrowid)
+        _record_event(
+            conn,
+            "agent_intent_suggested",
+            {"intent_id": intent_id, "prompt": prompt, "source": source},
+            node_id=None,
+        )
+        conn.commit()
+        return intent_id
+    finally:
+        conn.close()
+
+
+def get_pending_intent(intent_id: Optional[int] = None) -> Optional[Dict[str, Any]]:
+    """Fetch a pending intent by id or latest pending intent."""
+    ensure_db()
+    conn = _connect()
+    try:
+        if intent_id is not None:
+            row = conn.execute(
+                "SELECT id, prompt, summary, status, source, created_at, updated_at, node_id "
+                "FROM agent_intents WHERE id = ?",
+                (intent_id,),
+            ).fetchone()
+        else:
+            row = conn.execute(
+                "SELECT id, prompt, summary, status, source, created_at, updated_at, node_id "
+                "FROM agent_intents WHERE status = 'pending' ORDER BY created_at DESC LIMIT 1"
+            ).fetchone()
+        return dict(row) if row else None
+    finally:
+        conn.close()
+
+
+def get_pending_intent_by_source(source: str) -> Optional[Dict[str, Any]]:
+    """Fetch latest pending intent by source."""
+    ensure_db()
+    conn = _connect()
+    try:
+        row = conn.execute(
+            "SELECT id, prompt, summary, status, source, created_at, updated_at, node_id "
+            "FROM agent_intents WHERE status = 'pending' AND source = ? "
+            "ORDER BY created_at DESC LIMIT 1",
+            (source,),
+        ).fetchone()
+        return dict(row) if row else None
+    finally:
+        conn.close()
+
+
+def confirm_intent(intent_id: int) -> Dict[str, Any]:
+    """Confirm a pending agent intent and return its data."""
+    ensure_db()
+    conn = _connect()
+    try:
+        row = conn.execute(
+            "SELECT id, prompt, summary, status, source FROM agent_intents WHERE id = ?",
+            (intent_id,),
+        ).fetchone()
+        if not row:
+            raise StateValidationError(f"Intent {intent_id} does not exist")
+        if row["status"] != "pending":
+            raise StateValidationError(f"Intent {intent_id} is not pending")
+        now = _now_iso()
+        conn.execute(
+            "UPDATE agent_intents SET status = 'confirmed', updated_at = ? WHERE id = ?",
+            (now, intent_id),
+        )
+        _record_event(
+            conn,
+            "agent_intent_confirmed",
+            {"intent_id": intent_id, "prompt": row["prompt"]},
+            node_id=None,
+        )
+        conn.commit()
+        return dict(row)
+    finally:
+        conn.close()
+
+
+def reject_intent(intent_id: int, reason: str) -> None:
+    """Reject a pending agent intent."""
+    ensure_db()
+    conn = _connect()
+    try:
+        row = conn.execute(
+            "SELECT id, status FROM agent_intents WHERE id = ?",
+            (intent_id,),
+        ).fetchone()
+        if not row:
+            raise StateValidationError(f"Intent {intent_id} does not exist")
+        if row["status"] != "pending":
+            raise StateValidationError(f"Intent {intent_id} is not pending")
+        now = _now_iso()
+        conn.execute(
+            "UPDATE agent_intents SET status = 'rejected', updated_at = ? WHERE id = ?",
+            (now, intent_id),
+        )
+        _record_event(
+            conn,
+            "agent_intent_rejected",
+            {"intent_id": intent_id, "reason": reason},
+            node_id=None,
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def attach_intent_to_node(intent_id: int, node_id: str) -> None:
+    """Attach a confirmed intent to a node."""
+    ensure_db()
+    conn = _connect()
+    try:
+        row = conn.execute(
+            "SELECT id FROM agent_intents WHERE id = ?",
+            (intent_id,),
+        ).fetchone()
+        if not row:
+            raise StateValidationError(f"Intent {intent_id} does not exist")
+        now = _now_iso()
+        conn.execute(
+            "UPDATE agent_intents SET node_id = ?, updated_at = ? WHERE id = ?",
+            (node_id, now, intent_id),
+        )
+        _record_event(
+            conn,
+            "agent_intent_attached",
+            {"intent_id": intent_id, "node_id": node_id},
+            node_id=node_id,
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def log_anomaly(event_type: str, payload: Dict[str, Any], node_id: Optional[str] = None) -> None:
+    """Record an anomaly event for auditability."""
+    ensure_db()
+    conn = _connect()
+    try:
+        _record_event(conn, event_type, payload, node_id=node_id)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def validate_state() -> Dict[str, Any]:
+    """Basic state validation for doctor checks."""
+    ensure_db()
+    conn = _connect()
+    errors = []
+    try:
+        # Head must exist if set
+        head = _get_meta(conn, "head")
+        if head:
+            exists = conn.execute("SELECT 1 FROM nodes WHERE id = ?", (head,)).fetchone()
+            if not exists:
+                errors.append(f"Head points to non-existent node: {head}")
+
+        # Parent linkage must exist
+        rows = conn.execute("SELECT id, parent_id FROM nodes WHERE parent_id IS NOT NULL").fetchall()
+        for row in rows:
+            exists = conn.execute("SELECT 1 FROM nodes WHERE id = ?", (row["parent_id"],)).fetchone()
+            if not exists:
+                errors.append(f"Node {row['id']} parent points to non-existent node: {row['parent_id']}")
+
+        return {"valid": len(errors) == 0, "errors": errors}
+    finally:
+        conn.close()
 
 
 def detect_orphaned_nodes() -> dict:
     """Detect nodes that reference missing Git branches."""
     try:
         from . import git
-        
+
         state = load_state()
         nodes = state.get("nodes", {})
-        
+
         orphaned_nodes = []
         healthy_nodes = []
-        
+
         for node_id, node_data in nodes.items():
             ref = node_data.get("ref", "")
             if ref.startswith("refs/heads/"):
-                branch_name = ref[11:]  # Remove "refs/heads/"
-                
+                branch_name = ref[11:]
                 if git.branch_exists(branch_name):
-                    healthy_nodes.append({
-                        'node_id': node_id,
-                        'branch_name': branch_name,
-                        'prompt': node_data.get('prompt', ''),
-                        'parent': node_data.get('parent')
-                    })
+                    healthy_nodes.append(
+                        {
+                            "node_id": node_id,
+                            "branch_name": branch_name,
+                            "prompt": node_data.get("prompt", ""),
+                            "parent": node_data.get("parent"),
+                        }
+                    )
                 else:
-                    orphaned_nodes.append({
-                        'node_id': node_id,
-                        'branch_name': branch_name,
-                        'prompt': node_data.get('prompt', ''),
-                        'parent': node_data.get('parent'),
-                        'ref': ref
-                    })
-        
+                    orphaned_nodes.append(
+                        {
+                            "node_id": node_id,
+                            "branch_name": branch_name,
+                            "prompt": node_data.get("prompt", ""),
+                            "parent": node_data.get("parent"),
+                            "ref": ref,
+                        }
+                    )
+
         return {
-            'orphaned_nodes': orphaned_nodes,
-            'healthy_nodes': healthy_nodes,
-            'total_nodes': len(nodes),
-            'orphan_count': len(orphaned_nodes)
+            "orphaned_nodes": orphaned_nodes,
+            "healthy_nodes": healthy_nodes,
+            "total_nodes": len(nodes),
+            "orphan_count": len(orphaned_nodes),
         }
-        
     except Exception as e:
         raise StateError(f"Cannot detect orphaned nodes: {e}")
 
@@ -501,20 +698,20 @@ def suggest_orphan_cleanup() -> str:
     """Provide suggestions for cleaning up orphaned nodes."""
     try:
         info = detect_orphaned_nodes()
-        
-        if not info['orphaned_nodes']:
+
+        if not info["orphaned_nodes"]:
             return "✓ No orphaned nodes detected. All nodes have valid Git branches."
-        
+
         suggestions = []
         suggestions.append(f"⚠ Found {info['orphan_count']} orphaned nodes:")
         suggestions.append("")
-        
-        for node_info in info['orphaned_nodes']:
+
+        for node_info in info["orphaned_nodes"]:
             suggestions.append(f"  Node {node_info['node_id']}: {node_info['prompt']}")
             suggestions.append(f"    Missing branch: {node_info['branch_name']}")
-            if node_info['parent']:
+            if node_info["parent"]:
                 suggestions.append(f"    Parent: {node_info['parent']}")
-        
+
         suggestions.append("")
         suggestions.append("Cleanup options:")
         suggestions.append("1. Remove orphaned nodes from metadata:")
@@ -526,11 +723,7 @@ def suggest_orphan_cleanup() -> str:
         suggestions.append("   - You can still see them in 'stem list' with orphan indicator")
         suggestions.append("")
         suggestions.append(f"Healthy nodes: {len(info['healthy_nodes'])}/{info['total_nodes']}")
-        
+
         return "\n".join(suggestions)
-        
     except Exception as e:
         return f"Cannot provide orphan cleanup suggestions: {e}"
-def _validate_state(state: Dict) -> bool:
-    """Validate the structure and content of a state dictionary (legacy wrapper)."""
-    return _validate_state_detailed(state)['valid']
