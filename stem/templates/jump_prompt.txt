@@ -1,0 +1,6 @@
+You have jumped to a new stem context.
+
+Read `jump.json` for the branch/leaf context, then read `stem.md`.
+
+Summarize the context in one paragraph before making changes.
+Do not infer intent or create branches/commits.

@@ -1,237 +1,238 @@
 # stem
 
-## What problem this solves
+stem is a post-hoc, feature-led exploratory history system layered on top of Git. It is designed for long, iterative, AI-assisted coding sessions where intermediate states are easy to lose and unsafe exploration can derail work. Git remains the source of truth for code and history; stem adds explicit, append-only metadata and a strict workflow for features and revisions.
 
-During exploratory coding, refactoring, and AI-assisted development, developers frequently lose track of *why* they made changes. Git tracks what changed and when, but the reasoning behind decisions often gets lost in commit messages that are written after the fact.
+stem is not intent-led. It never infers intent from code changes and never auto-branches on file changes. All actions are triggered only by explicit commands.
 
-This becomes particularly problematic when:
-- Experimenting with different approaches and needing to backtrack
-- Working with AI agents that make rapid changes
-- Exploring unfamiliar codebases where context switching is expensive
-- Conducting research or learning where the journey matters as much as the destination
+---
 
-stem addresses this by requiring explicit intent declaration before making changes, creating a parallel layer of intentional checkpoints alongside your Git history.
+## Table of Contents
 
-stem is not a Git replacement. It works with Git to add a layer of intentional decision tracking.
+- Overview
+- Core Concepts
+- Non-Negotiable Invariants
+- Quick Start
+- CLI Commands
+- Agent Workflow (JSON Transport)
+- Storage and Data Model
+- Git Orchestration
+- Output Style
+- TUI (Planned)
+- Known Bugs
+- Non-goals
 
-## Core idea
+---
 
-stem introduces **intent-driven checkpoints** called **nodes**. Each node represents a deliberate decision point in your development process.
+## Overview
 
-A **node** contains:
-- An explicit prompt explaining WHY you're making changes
-- A snapshot of your working tree at that moment
-- A mechanical summary of WHAT actually changed
-- A unique identifier for navigation
+stem solves:
+- Losing track of useful intermediate states
+- Unsafe exploration during refactors or AI coding
+- Poor visibility of feature evolution
+- Navigating large exploratory histories
 
-Intent must be explicit because inference is unsafe. stem never guesses why you made changes - you must declare your reasoning before creating each checkpoint. This forces clarity of thought and preserves decision context.
+stem does not solve:
+- Decision causality
+- Merge/rebase abstraction
+- Automatic intent detection
+- Version control replacement
 
-## Non-goals (important)
+---
 
-stem does NOT:
-- Replace Git or abstract away Git concepts
-- Guess or infer your intent from code changes
-- Automatically create branches when files change without explicit intent
-- Allow AI agents to rewrite or modify your development history
-- Provide merge conflict resolution or advanced Git workflows
-- Work without Git (Git is a hard requirement)
+## Core Concepts
 
-stem is a complementary tool that adds intentional structure to your existing Git workflow.
+- **Branch (Feature)**
+  - A post-hoc labeled exploration direction
+  - Maps to a Git branch: `stem/<user>/<branch_id>-<slug>`
 
-## How stem works (mental model)
+- **Leaf (Revision)**
+  - A saved revision on a branch
+  - Linear and immutable
+  - Maps to a Git commit on the feature branch
 
-1. **Initialize**: `stem create` sets up stem metadata in your existing Git repository
-2. **Declare intent**: `stem branch "reason for changes"` creates a new node with your explicit reasoning
-3. **Make changes**: Edit your code as normal
-4. **Snapshot**: stem commits your changes with the declared intent
-5. **Navigate**: `stem jump 001` switches between different decision points
-6. **Fork**: Create new nodes from any previous state to explore alternatives
+Branches fork. Leaves do not.
 
-Each node is backed by a Git branch following the naming convention `stem/<user>/<id>-<slug>`.
-Metadata is stored in `.git/stem/stem.db` (SQLite) for fast lookups at scale.
+---
 
-## Installation
+## Non-Negotiable Invariants
 
-Requires Git and Python 3.8+.
+1. Git is the source of truth for code and history
+2. stem never infers intent from code changes
+3. stem never auto-branches on file changes
+4. All branching and saving is triggered only by explicit user commands
+5. Agents are helpers, never authoritative
+6. Agent misbehavior must not corrupt Git or stem state
+7. History is append-only, inspectable, replayable
+8. Must scale to 10,000+ branches and 50,000+ leaves
+9. CLI must remain usable without the TUI
+10. stem is not a Git replacement
 
-### From source (current method)
+---
 
-```bash
-git clone https://github.com/Parthita/stem-cli.git
-cd stem-cli
-pipx install .
+## Quick Start
+
+### 1) Initialize in a repo
+
 ```
-
-Or with pip:
-```bash
-pip install .
-```
-
-### From PyPI (coming soon)
-
-```bash
-pipx install stem-cli
-```
-
-Verify installation:
-```bash
-stem --help
-```
-
-## Basic usage
-
-```bash
-# Initialize stem in your Git repository
 stem create
-
-# Declare intent and create a checkpoint
-stem branch "add user authentication"
-# Creates node 001, stages all changes, commits with intent
-
-# List nodes (subtree by default, paginated)
-stem list
-
-# List full tree
-stem list --all
-
-# List a specific subtree
-stem list --root 005
-
-# Open read-only TUI for large histories
-stem tui
-
-# Navigate to a previous node
-stem jump 001
-# Checks out the Git branch for node 001
-
-# Continue from any node
-stem branch "try different approach"
-# Creates node 002 from current state
-
-# Start filesystem watcher for auto-commits
-stem watch
-# Monitors changes and auto-commits to current node
 ```
 
-Each `stem branch` command creates exactly one Git commit with your declared intent. The working tree is snapshotted as-is when you declare intent.
+### 2) Initialize for agent usage
 
-## Working with AI agents (optional)
-
-stem integrates with AI agents through explicit intent files and auto-branching only after changes occur:
-
-### Setup (One Command)
-```bash
-stem create --agent  # Sets up agent mode and starts background watcher
+```
+stem create --agent
 ```
 
-This single command:
-- Creates or appends to `AGENT.md` and `AGENTS.md` with integration rules (preserves existing content)
-- Writes strict prompt instructions to `.git/stem/context/agent_prompt.txt`
-- Sets up intent directory structure
-- Starts filesystem watcher in background automatically
+This creates:
+- `stem.md` (agent protocol)
+- `.stem/agent/branch.json`
+- `.stem/agent/leaf.json`
 
-### Agent Workflow
+---
 
-When a user gives an agent a prompt like "add a login form", the agent should:
+## CLI Commands
 
-1. **Write intent JSON** to `.git/stem/intent/next.json`:
-   ```json
-   {
-     "prompt": "add login form to homepage",
-     "summary": "Added LoginForm component with email/password fields"
-   }
-   ```
+### `stem create`
+- Initializes stem in the current directory
+- Initializes Git if missing
+- Creates `.stem/` metadata storage
+- Registers repo in the global registry
 
-2. **Make code changes** as requested
+### `stem create --agent`
+- Runs `stem create`
+- Writes `stem.md`
+- Writes `.stem/agent/branch.json` and `.stem/agent/leaf.json`
+- Prints bootstrap prompt for agent
 
-3. **System automatically creates node** after changes are detected and idle
-4. **After any `stem jump`**, agent reads `.git/stem/context/current.json` to restore context
+### `stem branch : <prompt>`
+- Creates a new feature branch
+- Creates the first leaf
 
-### Background Watcher Management
+### `stem update : <prompt>`
+- Saves a new leaf on the current branch
 
-```bash
-# Check watcher status
-stem watch-status
+### `stem update branch : <prompt>`
+- Saves a final leaf on the current branch
+- Starts a new branch + first leaf
 
-# Stop background watcher
-stem watch-stop <PID>
+### `stem jump`
+- `stem jump <branch_id>` -> jump to latest leaf on branch
+- `stem jump head <branch_id>` -> jump to first leaf
+- `stem jump <branch_id> <leaf_id>` -> jump to specific leaf
 
-# Start additional background watcher
-stem watch --background
-```
+### `stem list`
+- Compact summary of branches and leaves
 
-### Usage Options
+### `stem status`
+- Queue length
+- Watcher status
+- Last executed command
 
-**Automatic mode** (default with `--agent`):
-- Background watcher runs automatically
-- Agent writes intent JSON and makes changes
-- System automatically creates nodes
-- Terminal stays free for manual commands
+### `stem watch`
+- `stem watch --daemon` run background watcher
+- `stem watch --stop` stop watcher
 
-**Manual mode**:
-- Use `stem branch "prompt"` manually when ready
-- Full control over when nodes are created
-- Works alongside automatic mode
+---
 
-### Key Benefits
+## Agent Workflow (JSON Transport)
 
-- **Non-blocking**: Background watcher doesn't block terminal
-- **Automatic startup**: `stem create --agent` starts watcher automatically
-- **Preserves existing content**: Won't overwrite your existing agent instructions
-- **Dual workflow**: Both automatic and manual branching available
-- **Process management**: Easy start/stop/status commands for background watcher
+When the user types a stem command inside an agent, the agent does the coding work, then edits one of these existing files:
+- `.stem/agent/branch.json` for `stem branch`
+- `.stem/agent/leaf.json` for `stem update` and `stem update branch`
 
-The agent only writes the intent file and makes code changes. The background watcher handles branching automatically while keeping your terminal available for manual commands.
+The system auto-fills internal fields; the agent must not add hidden fields.
 
-If you need a copy-paste system prompt for agents:
-```bash
-stem agent-prompt
-```
+### stem branch
+1. Do the work first.
+2. Fill `prompt` and `summary` in `branch.json`.
+3. Save the file.
 
-### Intent Utilities
-```bash
-stem intent-list          # Show pending intents
-stem intent-list --all    # Show all intents
-stem intent-show 12       # Show intent details
-```
+### stem update
+1. Finish OLD work.
+2. Fill `old_prompt` and `old_summary` in `leaf.json`.
+3. Save the file.
+4. Only then start NEW work.
 
-## Safety and guarantees
+### stem update branch
+1. Finish OLD work.
+2. Fill `old_prompt` and `old_summary` in `leaf.json`.
+3. Save the file.
+4. Do NEW work.
+5. Fill `prompt` and `summary` in `branch.json`.
+6. Save the file.
 
-stem maintains these invariants:
-- One declared intent creates exactly one snapshot (Git commit)
-- Git remains the source of truth for all code and history
-- No automatic history rewriting or modification
-- State corruption fails loudly rather than silently
-- All operations are reversible through standard Git commands
+---
 
-If an agent writes intent but no code changes follow, the node is invalidated and recorded for inspection.
+## Storage and Data Model
 
-Your Git repository remains fully functional with or without stem. Removing stem leaves behind only additional Git branches and metadata files.
+- `.stem/stem.db` — repo-local SQLite metadata
+- `.stem/agent/` — JSON files edited by agents
+- `~/.stem/registry.db` — global repo registry
 
-## Who this tool is for
+SQLite supports:
+- O(1) lookup
+- pagination
+- search
+- lazy traversal for TUI
 
-stem is designed for developers who:
-- Engage in exploratory coding or research
-- Work on complex refactoring projects
-- Collaborate with AI agents on code changes
-- Need to maintain context during frequent context switching
-- Value explicit decision tracking over implicit commit messages
-- Want to experiment with different approaches while preserving decision history
+Internal metadata:
+- `current_branch_id`
+- `branch_count`
 
-## Who this tool is not for
+---
 
-stem may not be useful if you:
-- Prefer linear, single-branch development workflows
-- Want automation without explicit intent declaration
-- Are looking for Git abstraction or simplification
-- Need advanced Git workflow features (merging, rebasing, etc.)
-- Work primarily on small, straightforward changes
-- Prefer implicit documentation over explicit intent tracking
+## Git Orchestration
 
-## Status
+### Branch
+- `git checkout -b stem/<user>/<branch_id>-<slug>`
+- `git add -A`
+- `git commit --allow-empty -m "stem leaf <leaf_id>: <prompt>"`
 
-This is a v1 tool under active development. It has been tested across platforms and includes comprehensive error handling, but you should use it cautiously on important projects.
+### Update
+- `git add -A`
+- `git commit --allow-empty -m "stem leaf <leaf_id>: <prompt>"`
 
-The core functionality is stable, but the interface and features may evolve based on user feedback. We recommend trying stem on a small repository first to understand its workflow and determine if it fits your development style.
+### Jump
+- `git checkout <branch>` or `git checkout <commit>`
+- auto-stash when non-.stem changes exist
 
-Contributions, bug reports, and feedback are welcome. The tool is designed to be a thoughtful addition to your development toolkit rather than a replacement for existing workflows.
+---
+
+## Output Style
+
+- Short, skimmable, one screen
+- No verbose dumps
+
+---
+
+## TUI (Planned)
+
+- Read-only navigation for large histories
+- Keyboard-first, calm layout
+- Lazy loading
+- Clear visual tree
+
+---
+
+## Known Bugs (Current)
+
+- `update` does not always change node after jump
+- leaf can be duplicated if branching again after jump
+- jump edge cases still need handling
+
+---
+
+## Non-goals
+
+- Replace Git
+- Infer intent from code or diffs
+- Auto-branch from file changes
+- Hide or reinterpret Git semantics
+- Treat agent output as authoritative
+
+---
+
+## Notes
+
+- `.stem/` is automatically added to `.gitignore`.
+- The CLI is usable without the TUI.

@@ -1,0 +1,11 @@
+stem helper (must follow exactly)
+
+Use stem ONLY when the user's message STARTS WITH "stem ".
+If the user does NOT type a command starting with "stem ", do NOT use stem.
+
+Only edit existing files:
+- `.stem/agent/branch.json`
+- `.stem/agent/leaf.json`
+
+Do NOT add hidden/system fields. The system auto-fills them.
+Follow stem.md exactly.
